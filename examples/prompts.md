@@ -4,27 +4,30 @@ These are end-to-end prompts that should be resolvable via the SalomeMCP
 tools alone. Each one mixes one of the three input modalities (description,
 picture, vibrational target) with the geometry / mesh tool surface.
 
+All examples use the **millimetre** `space_units` default so the produced
+artefacts drop straight into the [pymodal](https://github.com/grcarmenaty/pymodal)
+pipeline. See `examples/los_alamos_demo.md` for a full pymodal-bound
+benchmark.
+
 ## 1. Pure description — bracket
 
 > Make me an L-shaped mounting bracket: a 100 × 60 × 8 mm vertical plate with
 > two 6 mm bolt holes 30 mm apart, joined to a 60 × 60 × 8 mm horizontal foot
 > with a single central 8 mm hole. Fillet the inside corner with R = 4 mm.
 
-Tool sequence the model should produce:
+Tool sequence the model should produce (default mm `space_units`):
 
 ```
 record_design_intent("L-bracket, 100x60x8 mm vertical, 60x60x8 mm foot, ...",
                      source="user_text")
-create_box("vert", dx=0.100, dy=0.060, dz=0.008)
-create_box("horiz", dx=0.060, dy=0.060, dz=0.008, cz=-0.008)
+create_box("vert",  dx=100, dy=60, dz=8)
+create_box("horiz", dx=60,  dy=60, dz=8, cz=-8)
 boolean("bracket_raw", "fuse", "vert", "horiz")
-create_cylinder("h1", radius=0.003, height=0.020, cx=0.020, cy=0.030, cz=-0.001, axis="Z")
-create_cylinder("h2", radius=0.003, height=0.020, cx=0.050, cy=0.030, cz=-0.001, axis="Z")
-create_cylinder("h3", radius=0.004, height=0.020, cx=0.030, cy=0.030, cz=-0.009, axis="Z")
-boolean("b1", "cut", "bracket_raw", "h1")
-boolean("b2", "cut", "b1", "h2")
-boolean("b3", "cut", "b2", "h3")
-fillet_all_edges("bracket", "b3", radius=0.004)
+create_cylinder("h1", radius=3, height=20, cx=20, cy=30, cz=-1, axis="Z")
+create_cylinder("h2", radius=3, height=20, cx=50, cy=30, cz=-1, axis="Z")
+create_cylinder("h3", radius=4, height=20, cx=30, cy=30, cz=-9, axis="Z")
+cut_list("bracket_drilled", "bracket_raw", ["h1", "h2", "h3"])
+fillet_all_edges("bracket", "bracket_drilled", radius=4)
 export_step("bracket", "/tmp/bracket.step")
 build()
 ```
@@ -39,43 +42,57 @@ record_design_intent(
     "Spur gear blank: 24 teeth, ~70 mm OD, 20 mm bore, 12 mm thick. "
     "Counted teeth visually; estimated diameters from the ruler in frame.",
     source="image")
-create_cylinder("blank", radius=0.035, height=0.012)
-create_cylinder("bore",  radius=0.010, height=0.014, cz=-0.001)
+create_cylinder("blank", radius=35, height=12)
+create_cylinder("bore",  radius=10, height=14, cz=-1)
 boolean("blank_with_bore", "cut", "blank", "bore")
-# tooth profile (simplified involute approximation, one tooth + circular pattern)
-create_polygon_face("tooth", points=[
-    [0.034, -0.0030], [0.040, -0.0010],
-    [0.040,  0.0010], [0.034,  0.0030],
-])
-extrude("tooth_solid", "tooth", height=0.012, direction="Z")
+# Simplified tooth profile, one tooth + circular pattern
+create_polygon_face("tooth", points=[[34,-3], [40,-1], [40, 1], [34, 3]])
+extrude("tooth_solid", "tooth", height=12, direction="Z")
 circular_pattern("teeth", source="tooth_solid", axis="Z", count=24)
 boolean("gear", "fuse", "blank_with_bore", "teeth")
 export_step("gear", "/tmp/gear.step")
 build()
 ```
 
-## 3. Vibrational target — singing bar
+## 3. Vibrational target — singing bar (pymodal-bound)
 
-> I need a free-free aluminium bar that rings at 1 kHz on its first
-> longitudinal mode... actually no, first bending mode in air, simple support.
+> I need a simply-supported aluminium bar that rings at 1 kHz on its first
+> bending mode, ready to feed a pymodal FRF pipeline.
+
+The vibrational helpers solve in SI metres; we convert into the session's
+millimetre `space_units` for the geometry calls and tag both end-faces as
+groups so Code_Aster can apply the simple supports.
 
 ```
 record_design_intent("1 kHz first bending mode, simply-supported aluminium bar.",
                      source="vibrational")
-list_materials()                     # confirm aluminum_6061 keys
+list_materials()
 beam_length_for_target_frequency(
     target_hz=1000, width=0.010, thickness=0.005,
     material="aluminum_6061", end_condition="simply-supported", mode=1
 )
-# -> {"length_m": 0.111..., ...}
-create_box("bar", dx=0.111, dy=0.010, dz=0.005)
+# -> {"length_m": 0.111..., ...}      => 111 mm in session units
+
+create_box("bar", dx=111, dy=10, dz=5)
 cantilever_beam_modes(length=0.111, width=0.010, thickness=0.005,
                       material="aluminum_6061",
                       end_condition="simply-supported", n_modes=3)
-# -> verify f1 ≈ 1000 Hz, gives f2/f3 for design margin
-create_mesh("bar_mesh", "bar", max_size=0.002, fineness="fine", second_order=True)
-export_mesh("bar_mesh", "/tmp/bar.med")
+
+add_face_group("support_left",  "bar", near_x=0,   near_y=5, near_z=2.5)
+add_face_group("support_right", "bar", near_x=111, near_y=5, near_z=2.5)
+
+create_mesh("bar_mesh", "bar", max_size=2, fineness="fine", second_order=True,
+            inherit_groups=["support_left", "support_right"])
+
+export_mesh("bar_mesh", "/work/bar.med",
+            format="med", med_version=41, auto_groups=False)
+export_nodes_json("bar_mesh", "/work/bar_nodes.json")
+export_groups_json("bar_mesh", "/work/bar_groups.json",
+                   extras={"boundary": "simply-supported"})
 build()
+
+# Map a hammer location to a mesh node for the FRF builder:
+closest_node("/work/bar_nodes.json", x=27, y=5, z=2.5)
 ```
 
 ## 4. Plate target — drum head

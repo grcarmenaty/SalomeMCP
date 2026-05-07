@@ -5,6 +5,12 @@ be rendered to a Salome Python script and (optionally) executed via
 ``salome -t``. This lets a model translate user input — text descriptions,
 its own image interpretation, or vibrational targets — into Salome
 structures one tool call at a time.
+
+The output is interoperable with the
+`pymodal <https://github.com/grcarmenaty/pymodal>`_ MCP: meshes can carry
+named groups, ``ExportMED`` writes MED v4.1 files with those groups, and
+companion ``nodes.json`` / ``groups.json`` files match the format
+``pymodal.load_nodes_json`` and pymodal's example pipelines expect.
 """
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ from typing import Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from salome_mcp.pymodal_bridge import closest_node_in_file
 from salome_mcp.runner import find_salome, run_script
 from salome_mcp.session import Session
 from salome_mcp.vibrational import (
@@ -30,6 +37,8 @@ SESSION = Session()
 Axis = Literal["X", "Y", "Z"]
 SignedAxis = Literal["X", "Y", "Z", "-X", "-Y", "-Z"]
 Plane = Literal["XY", "XZ", "YZ"]
+ShapeKind = Literal["FACE", "EDGE", "VERTEX", "SOLID"]
+SpaceUnits = Literal["millimeter", "meter"]
 
 
 # ---------------------------------------------------------------------------
@@ -37,21 +46,31 @@ Plane = Literal["XY", "XZ", "YZ"]
 # ---------------------------------------------------------------------------
 
 def _summary() -> str:
-    parts = [f"workdir: {SESSION.workdir}"]
+    parts = [f"workdir: {SESSION.workdir}",
+             f"space_units: {SESSION.space_units}"]
     parts.append(f"objects ({len(SESSION.objects)}):")
     parts.extend(
         [f"  - {n} ({e.kind})" for n, e in SESSION.objects.items()]
         or ["  (none)"]
     )
+    parts.append(f"groups ({len(SESSION.groups)}):")
+    parts.extend(
+        [f"  - {n} [{e.shape_type}] on {e.parent}"
+         for n, e in SESSION.groups.items()]
+        or ["  (none)"]
+    )
     parts.append(f"meshes ({len(SESSION.meshes)}):")
     parts.extend(
-        [f"  - {n} on {e.geometry}" for n, e in SESSION.meshes.items()]
+        [f"  - {n} on {e.geometry}"
+         + (f"  inherits={e.inherited_groups}" if e.inherited_groups else "")
+         for n, e in SESSION.meshes.items()]
         or ["  (none)"]
     )
     if SESSION.exports:
         parts.append(f"exports ({len(SESSION.exports)}):")
         parts.extend(
-            [f"  - {e['kind']}: {e['source']} -> {e['path']}" for e in SESSION.exports]
+            [f"  - {e['kind']}: {e['source']} -> {e['path']}"
+             for e in SESSION.exports]
         )
     if SESSION.notes:
         parts.append(f"notes: {len(SESSION.notes)}")
@@ -84,8 +103,20 @@ def set_workdir(path: str) -> str:
 
 
 @mcp.tool()
+def set_units(units: SpaceUnits) -> str:
+    """Set the session's spatial unit (``millimeter`` or ``meter``).
+
+    Affects STEP export's length unit and the ``space_units`` field written
+    into the companion ``nodes.json`` / ``groups.json`` files. The default
+    is ``millimeter`` to match pymodal's convention.
+    """
+    SESSION.set_units(units)
+    return f"space_units = {SESSION.space_units}"
+
+
+@mcp.tool()
 def list_objects() -> str:
-    """List geometry objects, meshes, and pending exports in the session."""
+    """List geometry objects, groups, meshes, and pending exports."""
     return _summary()
 
 
@@ -98,24 +129,27 @@ def get_object_info(name: str) -> str:
             {"kind": e.kind, "params": e.params, "var": e.var, "code": e.code},
             indent=2,
         )
+    if name in SESSION.groups:
+        g = SESSION.groups[name]
+        return json.dumps(
+            {"kind": "group", "shape_type": g.shape_type,
+             "parent": g.parent, "var": g.var, "code": g.code},
+            indent=2,
+        )
     if name in SESSION.meshes:
         m = SESSION.meshes[name]
         return json.dumps(
-            {
-                "kind": "mesh",
-                "geometry": m.geometry,
-                "params": m.params,
-                "var": m.var,
-                "code": m.code,
-            },
+            {"kind": "mesh", "geometry": m.geometry,
+             "inherited_groups": m.inherited_groups,
+             "params": m.params, "var": m.var, "code": m.code},
             indent=2,
         )
-    return f"No object or mesh named '{name}'."
+    return f"No object, group, or mesh named '{name}'."
 
 
 @mcp.tool()
 def clear_session() -> str:
-    """Remove all geometry, meshes, notes, and exports from the session."""
+    """Remove all geometry, groups, meshes, notes, and exports."""
     SESSION.reset()
     return "Session cleared."
 
@@ -128,7 +162,7 @@ def get_session_script() -> str:
 
 @mcp.tool()
 def save_session(path: str) -> str:
-    """Persist session state (objects, meshes, notes, exports) to JSON."""
+    """Persist session state (objects, groups, meshes, notes, exports) to JSON."""
     target = Path(path).expanduser().resolve()
     SESSION.save(target)
     return f"Session saved to {target}"
@@ -181,7 +215,7 @@ def build(salome_bin: Optional[str] = None, timeout: int = 600) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Primitive solids (axis-aligned by default; coordinates in metres)
+# Primitive solids (axis-aligned by default)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -194,7 +228,10 @@ def create_box(
     cy: float = 0.0,
     cz: float = 0.0,
 ) -> str:
-    """Axis-aligned box of size (dx, dy, dz) with the near corner at (cx,cy,cz)."""
+    """Axis-aligned box of size (dx, dy, dz) with the near corner at (cx,cy,cz).
+
+    Lengths are in the session's ``space_units`` (default millimetre).
+    """
     code = [
         f"{{var}} = geompy.MakeBox({cx}, {cy}, {cz}, "
         f"{cx + dx}, {cy + dy}, {cz + dz})"
@@ -313,10 +350,7 @@ def create_polygon_face(
     points: list[list[float]],
     plane: Plane = "XY",
 ) -> str:
-    """Closed planar polygon face from 2D points laid out on the chosen plane.
-
-    ``points`` is a list of ``[u, v]`` pairs; the polygon auto-closes.
-    """
+    """Closed planar polygon face from 2D points laid out on the chosen plane."""
     if len(points) < 3:
         raise ValueError("Polygon needs at least 3 points.")
     map_3d = {
@@ -432,8 +466,7 @@ def boolean(
     a: str,
     b: str,
 ) -> str:
-    """Boolean of two solids: ``fuse`` (union), ``cut`` (a − b),
-    ``common`` (intersection), or ``section`` (intersection curves)."""
+    """Boolean of two solids: ``fuse``, ``cut`` (a − b), ``common``, ``section``."""
     A = SESSION.require(a)
     B = SESSION.require(b)
     fn = {
@@ -449,6 +482,153 @@ def boolean(
         code_lines=code,
     )
     return f"{operation}({a}, {b}) -> '{name}'"
+
+
+@mcp.tool()
+def fuse_list(
+    name: str,
+    objects: list[str],
+    check_self_intersection: bool = False,
+    remove_extra_edges: bool = True,
+) -> str:
+    """Fuse many solids into one in a single robust call (``MakeFuseList``).
+
+    Preferred over chained pairwise ``fuse`` calls when assembling many
+    parts (plates + columns + screws). Useful for building meshable
+    welded assemblies for downstream pymodal FRF extraction.
+    """
+    if len(objects) < 2:
+        raise ValueError("fuse_list needs at least 2 objects.")
+    vars_ = [SESSION.require(o).var for o in objects]
+    args = ", ".join(vars_)
+    code = [
+        f"{{var}} = geompy.MakeFuseList(["
+        f"{args}], "
+        f"checkSelfInte={bool(check_self_intersection)}, "
+        f"rmExtraEdges={bool(remove_extra_edges)})"
+    ]
+    SESSION.add_object(
+        name=name, kind="fuse_list",
+        params={"objects": list(objects),
+                "check_self_intersection": bool(check_self_intersection),
+                "remove_extra_edges": bool(remove_extra_edges)},
+        code_lines=code,
+    )
+    return f"Fused {len(objects)} objects -> '{name}'"
+
+
+@mcp.tool()
+def cut_list(name: str, main: str, tools: list[str]) -> str:
+    """Subtract a list of solids from ``main`` (``MakeCutList``)."""
+    if not tools:
+        raise ValueError("cut_list needs at least one tool object.")
+    M = SESSION.require(main)
+    tool_vars = [SESSION.require(t).var for t in tools]
+    code = [
+        f"{{var}} = geompy.MakeCutList({M.var}, [{', '.join(tool_vars)}], False)"
+    ]
+    SESSION.add_object(
+        name=name, kind="cut_list",
+        params={"main": main, "tools": list(tools)},
+        code_lines=code,
+    )
+    return f"Cut {len(tools)} tools from '{main}' -> '{name}'"
+
+
+@mcp.tool()
+def common_list(name: str, objects: list[str]) -> str:
+    """Intersection of many solids in one call (``MakeCommonList``)."""
+    if len(objects) < 2:
+        raise ValueError("common_list needs at least 2 objects.")
+    vars_ = [SESSION.require(o).var for o in objects]
+    code = [
+        f"{{var}} = geompy.MakeCommonList([{', '.join(vars_)}], False)"
+    ]
+    SESSION.add_object(
+        name=name, kind="common_list",
+        params={"objects": list(objects)},
+        code_lines=code,
+    )
+    return f"Common of {len(objects)} objects -> '{name}'"
+
+
+# ---------------------------------------------------------------------------
+# Sub-shape groups (boundary conditions for Code_Aster downstream)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def add_face_group(
+    name: str,
+    geometry: str,
+    near_x: float,
+    near_y: float,
+    near_z: float,
+) -> str:
+    """Tag a single face of ``geometry`` as a named group, located by spatial probe.
+
+    The face closest to ``(near_x, near_y, near_z)`` is selected
+    (``geompy.GetFaceNearPoint``) and added as a FACE-type group. When a
+    mesh on the same geometry passes ``inherit_groups=[name]`` to
+    :func:`create_mesh`, the group is propagated to the MED export.
+    Standard pymodal pipelines (e.g. the Los Alamos benchmark) use such
+    groups to anchor Code_Aster boundary conditions like
+    ``base_rails``.
+    """
+    code = [
+        f"_p = geompy.MakeVertex({near_x}, {near_y}, {near_z})",
+        "_f = geompy.GetFaceNearPoint({parent_var}, _p)",
+        "{var} = geompy.CreateGroup({parent_var}, "
+        "geompy.ShapeType[{shape_type!r}])",
+        "geompy.UnionList({var}, [_f])",
+    ]
+    SESSION.add_group(name=name, parent=geometry, shape_type="FACE",
+                      code_lines=code,
+                      params={"near_point": [near_x, near_y, near_z]})
+    return f"Created FACE group '{name}' on '{geometry}'"
+
+
+@mcp.tool()
+def add_edge_group(
+    name: str,
+    geometry: str,
+    near_x: float,
+    near_y: float,
+    near_z: float,
+) -> str:
+    """Tag a single edge of ``geometry`` as a named group, located by spatial probe."""
+    code = [
+        f"_p = geompy.MakeVertex({near_x}, {near_y}, {near_z})",
+        "_e = geompy.GetEdgeNearPoint({parent_var}, _p)",
+        "{var} = geompy.CreateGroup({parent_var}, "
+        "geompy.ShapeType[{shape_type!r}])",
+        "geompy.UnionList({var}, [_e])",
+    ]
+    SESSION.add_group(name=name, parent=geometry, shape_type="EDGE",
+                      code_lines=code,
+                      params={"near_point": [near_x, near_y, near_z]})
+    return f"Created EDGE group '{name}' on '{geometry}'"
+
+
+@mcp.tool()
+def add_vertex_group(
+    name: str,
+    geometry: str,
+    x: float,
+    y: float,
+    z: float,
+) -> str:
+    """Tag a vertex of ``geometry`` as a named group (closest existing vertex)."""
+    code = [
+        f"_p = geompy.MakeVertex({x}, {y}, {z})",
+        "_v = geompy.GetVertexNearPoint({parent_var}, _p)",
+        "{var} = geompy.CreateGroup({parent_var}, "
+        "geompy.ShapeType[{shape_type!r}])",
+        "geompy.UnionList({var}, [_v])",
+    ]
+    SESSION.add_group(name=name, parent=geometry, shape_type="VERTEX",
+                      code_lines=code,
+                      params={"point": [x, y, z]})
+    return f"Created VERTEX group '{name}' on '{geometry}'"
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +835,7 @@ def import_step(name: str, file_path: str) -> str:
 
 @mcp.tool()
 def export_step(source: str, file_path: str) -> str:
-    """Schedule a STEP export of ``source`` when the script is built."""
+    """Schedule a STEP export of ``source`` (uses the session's space_units)."""
     SESSION.require(source)
     p = str(Path(file_path).expanduser().resolve())
     SESSION.add_export("step", source, p)
@@ -694,8 +874,16 @@ def create_mesh(
         "very_coarse", "coarse", "moderate", "fine", "very_fine"
     ] = "moderate",
     second_order: bool = False,
+    inherit_groups: Optional[list[str]] = None,
 ) -> str:
-    """Tetrahedral NETGEN 1D-2D-3D mesh on a solid geometry."""
+    """Tetrahedral NETGEN 1D-2D-3D mesh on a solid geometry.
+
+    ``inherit_groups`` is a list of geometry-group names (created via
+    :func:`add_face_group` / :func:`add_edge_group` / :func:`add_vertex_group`)
+    that will be propagated onto the mesh with ``mesh.GroupOnGeom`` so they
+    survive into MED export — required for downstream pymodal /
+    Code_Aster boundary-condition setup.
+    """
     SESSION.require(geometry)
     fineness_idx = {
         "very_coarse": 0, "coarse": 1, "moderate": 2,
@@ -710,16 +898,23 @@ def create_mesh(
         f"_params.SetMinSize({min_s})",
         f"_params.SetFineness({fineness_idx})",
         f"_params.SetSecondOrder({second_order})",
+        f"_params.SetOptimize(1)",
+        f"_params.SetQuadAllowed(0)",
         "_ok = {var}.Compute()",
+        "if not _ok:",
+        "    raise RuntimeError('NETGEN failed to mesh ' + repr({geom_var}))",
     ]
     SESSION.add_mesh(
         name=name, geometry=geometry,
         params={"max_size": max_size, "min_size": min_s,
                 "fineness": fineness, "second_order": second_order},
         code_lines=code,
+        inherit_groups=inherit_groups,
     )
+    inh = list(inherit_groups or [])
+    suffix = f", groups inherited: {inh}" if inh else ""
     return (f"Mesh '{name}' on '{geometry}' "
-            f"(max={max_size}, min={min_s}, fineness={fineness})")
+            f"(max={max_size}, min={min_s}, fineness={fineness}){suffix}")
 
 
 @mcp.tool()
@@ -727,14 +922,141 @@ def export_mesh(
     source: str,
     file_path: str,
     format: Literal["med", "unv", "stl"] = "med",
+    med_version: int = 41,
+    auto_groups: bool = False,
 ) -> str:
-    """Schedule a mesh export (.med, .unv, .stl) when the script is built."""
+    """Schedule a mesh export.
+
+    For MED format, ``med_version=41`` (MED v4.1) and ``auto_groups=False``
+    match what pymodal's example pipelines (e.g. the Los Alamos benchmark)
+    request. ``auto_groups=False`` keeps only the explicitly inherited
+    geometry groups in the file, so Code_Aster commands referencing
+    ``base_rails`` etc. resolve unambiguously.
+    """
     if source not in SESSION.meshes:
         raise KeyError(f"Mesh '{source}' not found.")
     p = str(Path(file_path).expanduser().resolve())
-    kind = {"med": "med", "unv": "unv", "stl": "stl_mesh"}[format]
+    if format == "med":
+        SESSION.add_export(
+            "med", source, p,
+            options={"version": int(med_version),
+                     "auto_groups": bool(auto_groups)},
+        )
+        return (f"Scheduled MED export (v{med_version}, "
+                f"auto_groups={auto_groups}): {source} -> {p}")
+    kind = {"unv": "unv", "stl": "stl_mesh"}[format]
     SESSION.add_export(kind, source, p)
     return f"Scheduled {format.upper()} mesh export: {source} -> {p}"
+
+
+@mcp.tool()
+def export_nodes_json(mesh: str, file_path: str) -> str:
+    """Schedule a pymodal-compatible ``nodes.json`` dump for ``mesh``.
+
+    The generated script writes ``{"<node_id>": [x, y, z], ...}`` to
+    ``file_path`` after meshing — the exact layout
+    ``pymodal.load_nodes_json`` and :func:`closest_node` expect.
+    Coordinates are in the session's ``space_units``.
+    """
+    if mesh not in SESSION.meshes:
+        raise KeyError(f"Mesh '{mesh}' not found.")
+    p = str(Path(file_path).expanduser().resolve())
+    SESSION.add_export("nodes_json", mesh, p)
+    return f"Scheduled nodes.json export: {mesh} -> {p}"
+
+
+@mcp.tool()
+def export_groups_json(
+    mesh: str,
+    file_path: str,
+    extras: Optional[dict] = None,
+) -> str:
+    """Schedule a pymodal-compatible ``groups.json`` dump for ``mesh``.
+
+    The file lists the named groups carried by the MED export plus any
+    extra free-form keys (e.g. ``rail_direction``) the downstream
+    Code_Aster setup needs. Pymodal's example pipelines read this file
+    when wiring boundary conditions.
+    """
+    if mesh not in SESSION.meshes:
+        raise KeyError(f"Mesh '{mesh}' not found.")
+    p = str(Path(file_path).expanduser().resolve())
+    SESSION.add_export(
+        "groups_json", mesh, p,
+        options={"extras": dict(extras or {})},
+    )
+    return f"Scheduled groups.json export: {mesh} -> {p}"
+
+
+# ---------------------------------------------------------------------------
+# pymodal interop helpers (read-only, no Salome required)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def closest_node(
+    nodes_json_path: str,
+    x: float,
+    y: float,
+    z: float,
+) -> str:
+    """Return the mesh node closest to ``(x, y, z)`` from a ``nodes.json`` file.
+
+    Equivalent to ``pymodal.closest_node`` after ``pymodal.load_nodes_json``.
+    Use this to map user-supplied excitation/measurement coordinates to mesh
+    nodes when wiring up an FRF extraction pipeline.
+    """
+    out = closest_node_in_file(Path(nodes_json_path).expanduser().resolve(),
+                               (x, y, z))
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
+def pymodal_handoff_summary() -> str:
+    """Describe the artefacts SalomeMCP has scheduled for the pymodal pipeline.
+
+    Lists the MED meshes, named groups carried into them, the companion
+    ``nodes.json`` / ``groups.json`` files, and the geometry coordinate
+    system (``space_units``). Useful to confirm the produced files are
+    consumable by ``pymodal.frf`` / ``pymodal.load_nodes_json`` /
+    ``pymodal.scenarios.build_frf_collection`` before running ``build``.
+    """
+    med_exports = [e for e in SESSION.exports if e["kind"] == "med"]
+    nodes_exports = [e for e in SESSION.exports if e["kind"] == "nodes_json"]
+    groups_exports = [e for e in SESSION.exports if e["kind"] == "groups_json"]
+    out: dict = {
+        "space_units": SESSION.space_units,
+        "med_meshes": [
+            {
+                "mesh": e["source"],
+                "path": e["path"],
+                "version": e.get("options", {}).get("version", 41),
+                "auto_groups": e.get("options", {}).get("auto_groups", False),
+                "inherited_groups": SESSION.meshes[e["source"]].inherited_groups,
+            }
+            for e in med_exports
+        ],
+        "nodes_json": [{"mesh": e["source"], "path": e["path"]}
+                       for e in nodes_exports],
+        "groups_json": [
+            {"mesh": e["source"], "path": e["path"],
+             "extras": e.get("options", {}).get("extras", {})}
+            for e in groups_exports
+        ],
+        "downstream": {
+            "pymodal.load_nodes_json": (
+                "consumes nodes.json -> (ids, coords) for closest_node()"
+            ),
+            "pymodal.frf": (
+                "expects measurements_units like "
+                "'millimeter / second ** 2 / newton' (accelerance) "
+                "and space_units matching this session"
+            ),
+            "Code_Aster": (
+                "uses MED group names (e.g. 'base_rails') as boundary anchors"
+            ),
+        },
+    }
+    return json.dumps(out, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +1088,7 @@ def cantilever_beam_modes(
 ) -> str:
     """First ``n_modes`` bending frequencies (Hz) of a slender prismatic beam.
 
-    Uses Euler-Bernoulli theory; bending occurs about the smaller-I axis.
+    Inputs are in **SI metres** (independent of session ``space_units``).
     Use ``list_materials`` for available material keys.
     """
     if material not in MATERIALS:
@@ -801,7 +1123,7 @@ def beam_length_for_target_frequency(
     ] = "cantilever",
     mode: int = 1,
 ) -> str:
-    """Beam length that places the n-th bending mode at ``target_hz``."""
+    """Beam length (SI metres) that puts the n-th bending mode at ``target_hz``."""
     if material not in MATERIALS:
         raise ValueError(f"Unknown material '{material}'.")
     m = MATERIALS[material]

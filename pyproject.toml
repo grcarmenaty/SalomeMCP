@@ -1,7 +1,7 @@
 [project]
 name = "salome-mcp"
-version = "0.1.0"
-description = "Model Context Protocol server for building Salome structures from descriptions, images, and vibrational targets."
+version = "0.2.0"
+description = "Model Context Protocol server for building Salome structures from descriptions, images, and vibrational targets — interoperable with the pymodal MCP."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -24,6 +24,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+pymodal = [
+    "pymodal>=0.2",
 ]
 
 [project.scripts]
